@@ -1,0 +1,14 @@
+# Ignore dataset files and generated data
+data/
+
+# Python virtualenv
+env/
+
+# PyTorch saved models
+*.pt
+*.pth
+
+# Byte-compiled / cached
+__pycache__/
+*.py[cod]
+

@@ -1,0 +1,48 @@
+# Generated from virtualenv c:\Develop\Brep\env
+# Note: torch CPU wheels use +cpu suffix and may require the official PyTorch index:
+#   pip install torch==2.9.1+cpu torchvision==0.24.1+cpu torchaudio==2.9.1+cpu --index-url https://download.pytorch.org/whl/cpu
+
+torch==2.9.1+cpu
+torchvision==0.24.1+cpu
+torchaudio==2.9.1+cpu
+
+# PyTorch Geometric and related (some wheels require the PyG wheels index)
+torch-geometric==2.7.0
+torch-scatter==2.1.2
+torch-sparse==0.6.18
+
+# Core numerical / scientific
+numpy==2.2.6
+scipy==1.15.3
+
+# CAD / OCC
+cadquery==2.6.1
+cadquery-ocp==7.8.1.1.post1
+
+# Visualization & utils
+matplotlib==3.10.7
+pillow==12.0.0
+vtk==9.3.1
+
+# I/O, parsing, misc
+pyyaml==6.0.3
+requests==2.32.5
+networkx==3.3
+sympy==1.14.0
+mpmath==1.3.0
+filelock==3.19.1
+fsspec==2025.10.0
+tqdm==4.67.1
+
+# Packaging / helpers
+packaging==25.0
+pyparsing==3.2.5
+jinja2==3.1.6
+typing-extensions==4.15.0
+
+# Trame (optional)
+trame==3.12.0
+trame-client==3.11.2
+
+# Note: Some packages (torch-geometric and its extensions) are provided as platform-specific wheels.
+# For reproducible installation, follow PyG installation guide: https://pytorch-geometric.readthedocs.io/en/latest/notes/installation.html
