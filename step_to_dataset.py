@@ -23,7 +23,7 @@ NUM_TYPES = len(SURFACE_TYPES)
 
 
 def get_face_basic_features(ocp_face):
-    """基本特徴量: [Type(5), LogArea, NumWires, NumEdges]"""
+    """基本特徴量 v6: [Type(5), LogArea, NumWires, NumEdges, IsClosed(1)]"""
     adaptor = BRepAdaptor_Surface(ocp_face)
     try:
         s_type = adaptor.GetType()
@@ -71,7 +71,13 @@ def get_face_basic_features(ocp_face):
     except Exception:
         n_edges = 0
 
-    return one_hot + [norm_area, n_wires * 0.2, n_edges * 0.05]
+    # IsClosed: 円筒や球、トーラスなど UまたはV方向に閉じている面を検出
+    try:
+        is_closed_flag = 1.0 if (adaptor.IsUClosed() or adaptor.IsVClosed()) else 0.0
+    except Exception:
+        is_closed_flag = 0.0
+
+    return one_hot + [norm_area, n_wires * 0.2, n_edges * 0.05, is_closed_flag]
 
 
 def get_convexity(edge, f1, f2, debug=False):
@@ -157,7 +163,7 @@ def process_step_to_pyg(filename, debug=False):
     # 2. Build adjacency by scanning shared edges between face pairs
     adj_src = []
     adj_dst = []
-    convexity_feats = [[0, 0, 0] for _ in range(len(ocp_faces))]
+    edge_attr_list = []  # 新設: エッジごとの属性 (one-hot: [convex, concave, smooth])
 
     total_convex = 0
     total_concave = 0
@@ -190,21 +196,28 @@ def process_step_to_pyg(filename, debug=False):
                     exp_e2.Next()
 
                 if found:
-                    # adjacency
+                    # adjacency (bidirectional)
                     adj_src.extend([i_a, i_b])
                     adj_dst.extend([i_b, i_a])
                     candidate_edges += 1
-                    # compute convexity
+                    # compute convexity for this shared edge
                     cvx = get_convexity(ea, fa, fb, debug=debug)
                     if debug and cvx != 0.0:
                         print(f"Edge between faces {i_a}-{i_b}: convexity={cvx}")
-                    feat_idx = 0 if cvx > 0 else (1 if cvx < 0 else 2)
-                    convexity_feats[i_a][feat_idx] += 1
-                    convexity_feats[i_b][feat_idx] += 1
+
+                    # Edge attribute: one-hot [Convex, Concave, Smooth]
+                    attr = [0.0, 0.0, 0.0]
                     if cvx > 0:
+                        attr[0] = 1.0
                         total_convex += 1
-                    if cvx < 0:
+                    elif cvx < 0:
+                        attr[1] = 1.0
                         total_concave += 1
+                    else:
+                        attr[2] = 1.0
+
+                    # add attribute for both directions
+                    edge_attr_list.extend([attr, attr])
                     matched_pairs += 1
                 # next candidate fb
             exp_e.Next()
@@ -214,16 +227,19 @@ def process_step_to_pyg(filename, debug=False):
         print(f"Candidate edges(found by shared-edge scan): {candidate_edges}, Matched pairs: {matched_pairs}")
 
     # 3. Combine features
-    final_x = []
-    for base, cvx in zip(face_feats, convexity_feats):
-        norm_cvx = [c * 0.1 for c in cvx]
-        final_x.append(base + norm_cvx)
-
+    # Node features: 基本特徴量のみ（凸凹のカウントは廃止し、エッジ属性へ移行）
+    final_x = face_feats
     x = torch.tensor(final_x, dtype=torch.float)
     if len(adj_src) == 0:
         edge_index = torch.empty((2, 0), dtype=torch.long)
     else:
         edge_index = torch.tensor([adj_src, adj_dst], dtype=torch.long)
 
-    return Data(x=x, edge_index=edge_index)
+    # edge_attr を作成（存在しない場合は空テンソル）
+    if len(edge_attr_list) == 0:
+        edge_attr = torch.empty((0, 3), dtype=torch.float)
+    else:
+        edge_attr = torch.tensor(edge_attr_list, dtype=torch.float)
+
+    return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
 

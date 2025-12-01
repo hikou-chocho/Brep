@@ -4,11 +4,12 @@ import glob
 import random
 from torch_geometric.loader import DataLoader
 import torch.nn.functional as F
+from collections import Counter
 # sklearn is not required; using manual accuracy calculation
 
 # 自作モジュール
 from step_to_dataset import process_step_to_pyg
-from model import BRepNetLite
+from model import BRepNetModern
 
 # データセットのパス設定 (環境に合わせて書き換えてください)
 DATA_ROOT = "./data/breps"
@@ -114,11 +115,40 @@ def train_proper():
     train_dataset = dataset[:split_idx]
     test_dataset = dataset[split_idx:]
     
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False)
+    # バッチサイズを大きめに設定して BatchNorm を効かせる
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
     # 3. モデル定義
-    model = BRepNetLite(num_node_features=11, num_classes=10).to(device)
+    # Node features: 基本特徴量 v6 = 9 (IsClosed を追加)
+    # Edge features: [Convex, Concave, Smooth] = 3
+    # --- クラス重みを計算して損失に反映する ---
+    NUM_CLASSES = 10
+    # 集計関数
+    def calculate_class_weights(dataset, num_classes):
+        print("Calculating class weights...")
+        all_labels = []
+        for data in dataset:
+            if hasattr(data, 'y'):
+                all_labels.extend(data.y.tolist())
+        counts = Counter(all_labels)
+        total = len(all_labels) if len(all_labels) > 0 else 1
+        weights = torch.zeros(num_classes, dtype=torch.float)
+        for cls_idx in range(num_classes):
+            c = counts.get(cls_idx, 0)
+            if c > 0:
+                weights[cls_idx] = total / (num_classes * c)
+            else:
+                weights[cls_idx] = 1.0
+        # Smooth weights to avoid extreme penalties: sqrt and clamp
+        weights = torch.sqrt(weights)
+        weights = torch.clamp(weights, max=10.0)
+        print(f"Smoothed Class Weights: {weights}")
+        return weights
+
+    class_weights = calculate_class_weights(train_dataset, NUM_CLASSES).to(device)
+
+    model = BRepNetModern(num_node_features=9, num_edge_features=3, num_classes=NUM_CLASSES, hidden_dim=128).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
 
     # 4. 学習ループ（Best-test-acc 保存ロジックを追加）
@@ -131,7 +161,8 @@ def train_proper():
             batch = batch.to(device)
             optimizer.zero_grad()
             out = model(batch)
-            loss = F.nll_loss(out, batch.y)
+            # 重み付き損失を使用（クラス分布に応じたペナルティ）
+            loss = F.nll_loss(out, batch.y, weight=class_weights)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
