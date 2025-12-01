@@ -1,5 +1,6 @@
 import sys
 import os
+import math
 import cadquery as cq
 try:
     import torch
@@ -13,12 +14,16 @@ except Exception:
 
 # === OCP インポート ===
 from OCP.TopExp import TopExp, TopExp_Explorer
-from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_VERTEX
+from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_VERTEX, TopAbs_WIRE, TopAbs_REVERSED
 from OCP.BRep import BRep_Tool
 from OCP.TopoDS import TopoDS
 from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
 # 特徴量抽出用に追加
 from OCP.BRepAdaptor import BRepAdaptor_Surface
+from OCP.BRepAdaptor import BRepAdaptor_Curve
+from OCP.CSLib import CSLib
+from OCP.ShapeAnalysis import ShapeAnalysis_Surface
+from OCP.gp import gp_Vec, gp_Pnt
 from OCP.GeomAbs import (GeomAbs_Plane, GeomAbs_Cylinder, GeomAbs_Cone, 
                          GeomAbs_Sphere, GeomAbs_Torus, GeomAbs_BezierSurface, 
                          GeomAbs_BSplineSurface)
@@ -208,26 +213,112 @@ NUM_TYPES = len(SURFACE_TYPES)
 
 def get_face_features_tensor(ocp_face):
     """
-    面から特徴量ベクトルを作成する
-    One-Hot (NUM_TYPES) + 面積 -> 長さ NUM_TYPES+1
+    [v2] 面からリッチな特徴量ベクトルを作成する
+    構成: [Type(7), LogArea(1), NumWires(1), NumEdges(1)] -> 合計 NUM_TYPES + 3 次元
     """
+    # 1. 曲面タイプ (One-Hot)
     adaptor = BRepAdaptor_Surface(ocp_face)
     surf_type = adaptor.GetType()
-
+    
     one_hot = [0.0] * NUM_TYPES
-    for idx, t in enumerate(SURFACE_TYPES):
-        try:
-            if surf_type == t:
-                one_hot[idx] = 1.0
-                break
-        except Exception:
-            continue
-
+    if surf_type in SURFACE_TYPES:
+        idx = SURFACE_TYPES.index(surf_type)
+        one_hot[idx] = 1.0
+    
+    # 2. 面積 (対数正規化)
     props = GProp_GProps()
     BRepGProp.SurfaceProperties_s(ocp_face, props)
-    area = props.Mass()
+    raw_area = props.Mass()
+    
+    # log(area + 1) で0除算を防ぎつつ正規化
+    # さらに適当な係数(例: 0.1)を掛けて 0~1 近辺に寄せると学習が安定します
+    norm_area = math.log(raw_area + 1.0) * 0.1
 
-    return one_hot + [area]
+    # 3. ワイヤー数 (穴あき情報のヒント)
+    num_wires = 0
+    try:
+        w_exp = TopExp_Explorer(ocp_face, TopAbs_WIRE)
+        while w_exp.More():
+            num_wires += 1
+            w_exp.Next()
+    except Exception:
+        num_wires = 0
+
+    # 4. エッジ数 (複雑さのヒント)
+    num_edges = 0
+    try:
+        e_exp = TopExp_Explorer(ocp_face, TopAbs_EDGE)
+        while e_exp.More():
+            num_edges += 1
+            e_exp.Next()
+    except Exception:
+        num_edges = 0
+
+    # 正規化: エッジ数やワイヤー数も大きくなりすぎないようにスケーリング
+    norm_wires = num_wires * 0.2
+    norm_edges = num_edges * 0.05
+
+    # リスト結合: [Type(7)] + [Area, Wires, Edges]
+    feature_vec = one_hot + [norm_area, norm_wires, norm_edges]
+    return feature_vec
+
+
+def get_convexity(edge, face1, face2):
+    """
+    エッジに対して凸(1)、凹(-1)、滑らか/不明(0) を返す。
+    """
+    try:
+        # エッジ中点と接線
+        ca = BRepAdaptor_Curve(edge)
+        u_min = ca.FirstParameter()
+        u_max = ca.LastParameter()
+        u = (u_min + u_max) / 2.0
+        p_mid = ca.Value(u)
+        tan = gp_Vec()
+        ca.D1(u, p_mid, tan)
+        # エッジ向きを考慮
+        try:
+            if edge.Orientation() == TopAbs_REVERSED:
+                tan.Reverse()
+        except Exception:
+            pass
+
+        # 面上の法線取得 (ShapeAnalysis を使ってUVを取得)
+        def _normal_at(face, point):
+            try:
+                s_adapt = BRepAdaptor_Surface(face)
+                sas = ShapeAnalysis_Surface(s_adapt.Surface().Surface())
+                uv = sas.ValueOfUV(point, 1e-6)
+                # D1 を使って接線を取り、外積で法線を得る
+                ptmp = gp_Pnt()
+                du = gp_Vec()
+                dv = gp_Vec()
+                s_adapt.D1(uv.X(), uv.Y(), ptmp, du, dv)
+                # 法線 = du x dv
+                n = du.Crossed(dv)
+                if face.Orientation() == TopAbs_REVERSED:
+                    n.Reverse()
+                return n
+            except Exception:
+                return None
+
+        n1 = _normal_at(face1, p_mid)
+        n2 = _normal_at(face2, p_mid)
+        if n1 is None or n2 is None:
+            return 0.0
+
+        # 外積と接線の内積で凸凹判定
+        cp = n1.Crossed(n2)
+        dot = cp.Dot(tan)
+        thr = 1e-4
+        if dot > thr:
+            return 1.0
+        elif dot < -thr:
+            return -1.0
+        else:
+            return 0.0
+    except Exception:
+        return 0.0
 
 
 def build_adjacency_list(shape, ocp_faces):
@@ -338,26 +429,102 @@ def process_step_to_pyg(filename):
 
     shape = model.val().wrapped
 
-    # ノード列挙と特徴量抽出
+    # 1) Faces とそのタイプを先に列挙
     ocp_faces = []
-    x_data = []
+    face_types = []
     exp = TopExp_Explorer(shape, TopAbs_FACE)
     while exp.More():
         f = TopoDS.Face_s(exp.Current())
         ocp_faces.append(f)
-        vec = get_face_features_tensor(f)
-        x_data.append(vec)
+
+        # タイプ判定（未知の場合は NUM_TYPES を割り当てる）
+        try:
+            adaptor = BRepAdaptor_Surface(f)
+            s_type = adaptor.GetType()
+            if s_type in SURFACE_TYPES:
+                t_idx = SURFACE_TYPES.index(s_type)
+            else:
+                t_idx = NUM_TYPES
+        except Exception:
+            t_idx = NUM_TYPES
+
+        face_types.append(t_idx)
         exp.Next()
 
-    if len(x_data) == 0:
+    if len(ocp_faces) == 0:
         return None
+
+    # 2) 隣接関係を構築
+    adjacency_list = build_adjacency_list(shape, ocp_faces)
+
+    # edge_map を構築して Edge オブジェクトと関連面インデックスを保持
+    edge_map = {}
+    for fi, f in enumerate(ocp_faces):
+        exp_e = TopExp_Explorer(f, TopAbs_EDGE)
+        while exp_e.More():
+            e = exp_e.Current()
+            try:
+                key = e.HashCode(2147483647)
+            except Exception:
+                key = repr(e)
+
+            if key not in edge_map:
+                edge_map[key] = [e, []]
+            edge_map[key][1].append(fi)
+            exp_e.Next()
+
+    # 3) 隣接タイプのカウントを計算
+    # 各面ごとに (NUM_TYPES + 1) 長のカウンタを持つ (未知タイプ用のスロット含む)
+    neighbor_counts = [[0] * (NUM_TYPES + 1) for _ in range(len(ocp_faces))]
+    for a, b in adjacency_list:
+        # 双方向でカウント
+        t_b = face_types[b] if b < len(face_types) else NUM_TYPES
+        t_a = face_types[a] if a < len(face_types) else NUM_TYPES
+        neighbor_counts[a][t_b] += 1
+        neighbor_counts[b][t_a] += 1
+
+    # 4) 特徴量ベクトルを作成 (v2 のベース + 隣接タイプカウントを連結)
+    x_data = []
+    # convexity counts per face: [convex_count, concave_count, flat_count]
+    convexity_counts = [[0, 0, 0] for _ in range(len(ocp_faces))]
+
+    # 計算: edge_map を巡回し、2面共有エッジのみ判定
+    for key, (edge_obj, faces_idx) in edge_map.items():
+        if len(faces_idx) >= 2:
+            # 通常は2面だが、非多様体のため複数ある場合は全ペア処理
+            # 全てのペアについて convexity を評価してカウント
+            for i in range(len(faces_idx)):
+                for j in range(i + 1, len(faces_idx)):
+                    fi = faces_idx[i]
+                    fj = faces_idx[j]
+                    try:
+                        cv = get_convexity(edge_obj, ocp_faces[fi], ocp_faces[fj])
+                    except Exception:
+                        cv = 0.0
+
+                    if cv > 0:
+                        convexity_counts[fi][0] += 1
+                        convexity_counts[fj][0] += 1
+                    elif cv < 0:
+                        convexity_counts[fi][1] += 1
+                        convexity_counts[fj][1] += 1
+                    else:
+                        convexity_counts[fi][2] += 1
+                        convexity_counts[fj][2] += 1
+
+    for i, f in enumerate(ocp_faces):
+        base_vec = get_face_features_tensor(f)
+        # 正規化係数: 値が大きくなり過ぎないようスケーリング
+        neighbor_vec = [float(c) * 0.2 for c in neighbor_counts[i]]
+        # convexity 正規化（小さめの係数）
+        cvx = convexity_counts[i]
+        cvx_vec = [float(cvx[0]) * 0.1, float(cvx[1]) * 0.1, float(cvx[2]) * 0.05]
+        full_vec = base_vec + neighbor_vec + cvx_vec
+        x_data.append(full_vec)
 
     x = torch.tensor(x_data, dtype=torch.float)
 
-    # 隣接リスト構築（既存の堅牢なロジックを使う）
-    adjacency_list = build_adjacency_list(shape, ocp_faces)
-
-    # edge_index を作成（無向グラフ -> 双方向で保存）
+    # 5) edge_index を作成（無向グラフ -> 双方向で保存）
     src_list = []
     dst_list = []
     for a, b in adjacency_list:
@@ -406,7 +573,7 @@ if __name__ == "__main__":
         print("\n=== PyTorch Geometric Data Object ===")
         print(data)
         print("-" * 30)
-        print(f"x (Features): \n{data.x.shape}  <- [Nodes, {NUM_TYPES + 1} dims ({NUM_TYPES} Type + 1 Area)]")
+        print(f"x (Features): \n{data.x.shape}  <- [Nodes, {NUM_TYPES + 3} dims ({NUM_TYPES} Type + 'LogArea+Wires+Edges)])")
         print(f"edge_index: \n{data.edge_index.shape}  <- [2, Edges]")
         
         # 保存

@@ -1,8 +1,10 @@
 import torch
 import os
 import glob
+import random
 from torch_geometric.loader import DataLoader
 import torch.nn.functional as F
+# sklearn is not required; using manual accuracy calculation
 
 # 自作モジュール
 from step_to_dataset import process_step_to_pyg
@@ -12,6 +14,7 @@ from model import BRepNetLite
 DATA_ROOT = "./data/breps"
 STEP_DIR = os.path.join(DATA_ROOT, "step")
 SEG_DIR = os.path.join(DATA_ROOT, "seg")
+
 
 def load_fusion360_seg_labels(seg_path, num_faces):
     """
@@ -23,21 +26,18 @@ def load_fusion360_seg_labels(seg_path, num_faces):
       ... (1行に1つのクラスID)
     """
     if not os.path.exists(seg_path):
-        print(f"Label file not found: {seg_path}")
+        # print warning at caller
         return None
 
     try:
         with open(seg_path, 'r') as f:
             # 各行を読み込み、空白を除去して整数に変換
             labels_list = [int(line.strip()) for line in f if line.strip().isdigit()]
-    except Exception as e:
-        print(f"Error reading .seg file: {e}")
+    except Exception:
         return None
 
     # STEPから読み取った面の数と、ラベルの数が一致するか確認
     if len(labels_list) != num_faces:
-        print(f"Warning: Face count mismatch! STEP:{num_faces} vs SEG:{len(labels_list)}")
-        
         # 安全策: 数が合わない場合のパディング/切り詰め処理
         if len(labels_list) > num_faces:
             labels_list = labels_list[:num_faces]
@@ -47,55 +47,87 @@ def load_fusion360_seg_labels(seg_path, num_faces):
 
     return torch.tensor(labels_list, dtype=torch.long)
 
-def train():
+
+def calc_accuracy(loader, model, device):
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+            out = model(batch)
+            pred = out.argmax(dim=1)
+            correct += (pred == batch.y).sum().item()
+            total += batch.y.size(0)
+    return correct / total if total > 0 else 0.0
+
+
+def load_labels(seg_path, num_faces):
+    return load_fusion360_seg_labels(seg_path, num_faces)
+
+
+def train_proper():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-
-    # --- 1. データセット構築ループ ---
+    
+    # 1. データ収集 (全ファイル対象)
+    step_files = glob.glob(os.path.join(STEP_DIR, "*.stp"))
     dataset = []
-    
-    # STEPファイルを検索
-    step_files = glob.glob(os.path.join(STEP_DIR, "*.stp"))[:10] # まずは10個だけでテスト
-    
-    print(f"Found {len(step_files)} step files. Processing...")
+    print(f"Loading {len(step_files)} files...")
 
-    for step_path in step_files:
-        # 対応する .seg ファイルのパスを作成
-        # ファイル名 (例: 1234.step -> 1234.seg)
+    # データ量が多すぎる環境向けにサンプリングで削減（既定で30%に削減）
+    try:
+        sample_ratio = float(os.environ.get('DATA_SAMPLE_RATIO', '1.0'))
+    except Exception:
+        sample_ratio = 0.3
+    if sample_ratio <= 0 or sample_ratio > 1:
+        sample_ratio = 0.3
+    keep_n = max(1, int(len(step_files) * sample_ratio))
+    if len(step_files) > keep_n:
+        random.shuffle(step_files)
+        step_files = step_files[:keep_n]
+    print(f"Sampling dataset: keeping {len(step_files)} of {len(glob.glob(os.path.join(STEP_DIR, '*.stp')))} files ({sample_ratio*100:.0f}%)")
+    for i, step_path in enumerate(step_files):
         base_name = os.path.splitext(os.path.basename(step_path))[0]
         seg_path = os.path.join(SEG_DIR, base_name + ".seg")
-        
-        # 1. STEP -> Graph
+        if i % 10 == 0:
+            print(f"Processing {i}/{len(step_files)}...", end="\r")
+
         data = process_step_to_pyg(step_path)
-        if data is None: continue
-            
-        # 2. SEG -> Labels
-        labels = load_fusion360_seg_labels(seg_path, data.num_nodes)
-        if labels is None: continue
-            
+        if data is None:
+            continue
+
+        labels = load_labels(seg_path, data.num_nodes)
+        if labels is None:
+            continue
         data.y = labels
         dataset.append(data)
-        print(f"Loaded: {base_name} (Nodes: {data.num_nodes})")
+
+    print(f"\nTotal valid graphs: {len(dataset)}")
 
     if len(dataset) == 0:
         print("No valid data found.")
         return
 
-    loader = DataLoader(dataset, batch_size=1, shuffle=True)
+    # 2. Train / Test 分割 (8:2)
+    random.shuffle(dataset)
+    split_idx = int(len(dataset) * 0.8)
+    train_dataset = dataset[:split_idx]
+    test_dataset = dataset[split_idx:]
+    
+    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False)
 
-    # --- 2. モデル定義 ---
-    # クラス数は .seg 内の最大値から推測するか、Fusion360の定義(通常8〜10クラス)に合わせる
-    NUM_CLASSES = 10 
-    model = BRepNetLite(num_node_features=8, num_classes=NUM_CLASSES).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    # 3. モデル定義
+    model = BRepNetLite(num_node_features=11, num_classes=10).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
 
-    model.train()
-
-    # --- 3. 学習 ---
-    print("\nStart Training...")
+    # 4. 学習ループ（Best-test-acc 保存ロジックを追加）
+    print("\nStart Training Loop...")
+    best_acc = 0.0
     for epoch in range(50):
-        total_loss = 0
-        for batch in loader:
+        model.train()
+        total_loss = 0.0
+        for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad()
             out = model(batch)
@@ -104,12 +136,19 @@ def train():
             optimizer.step()
             total_loss += loss.item()
 
-        if epoch % 10 == 0:
-            print(f'Epoch {epoch:03d}, Loss: {total_loss:.4f}')
+        # 毎エポックで評価してベストモデルを保存
+        train_acc = calc_accuracy(train_loader, model, device)
+        test_acc = calc_accuracy(test_loader, model, device)
+        print(f"Epoch {epoch:03d} | Loss: {total_loss:.4f} | Train Acc: {train_acc:.2%} | Test Acc: {test_acc:.2%}")
 
-    # 保存
-    torch.save(model.state_dict(), "brepnet_poc.pth")
-    print("Training finished & Model saved.")
+        if test_acc > best_acc:
+            best_acc = test_acc
+            try:
+                torch.save(model.state_dict(), "brepnet_best.pth")
+                print(f"  >>> Best Model Saved! ({best_acc:.2%})")
+            except Exception as e:
+                print(f"Failed to save best model: {e}")
+
 
 if __name__ == "__main__":
-    train()
+    train_proper()
